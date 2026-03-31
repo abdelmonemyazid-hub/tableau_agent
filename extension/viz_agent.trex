@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest manifest-version="0.1" xmlns="http://www.tableau.com/xml/extension_manifest">
+  <dashboard-extension id="com.vizagent.text2viz" extension-version="1.0.0">
+    <default-locale>fr_FR</default-locale>
+    <name resource-id="name"/>
+    <description>Agent Text-to-Viz — Génère des visualisations Tableau depuis le langage naturel.</description>
+    <author name="PFE" email="pfe@vizagent.local" organization="PFE" website="https://localhost:8000"/>
+    <min-api-version>1.7</min-api-version>
+    <source-location>
+      <!-- L'extension est servie localement via un simple serveur HTTP -->
+      <url>http://localhost:8765/index.html</url>
+    </source-location>
+    <icon>iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAABhklEQVQ4T2NkIBIwEqmHgTQNAABHAAH/dq4rAAAAAElFTkSuQmCC</icon>
+    <permissions>
+      <permission>full data</permission>
+    </permissions>
+  </dashboard-extension>
+  <resources>
+    <resource id="name">
+      <text locale="fr_FR">Viz Agent</text>
+      <text locale="en_US">Viz Agent</text>
+    </resource>
+  </resources>
+</manifest>

@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip --version)",
+      "Bash(ollama --version)",
+      "Bash(python -m pip --version)",
+      "Bash(python3 -m pip --version)",
+      "Bash(ollama list:*)",
+      "Bash(curl -s -X POST http://localhost:11434/api/chat -H \"Content-Type: application/json\" -d \"{\"\"model\"\":\"\"llama3:latest\"\",\"\"stream\"\":false,\"\"messages\"\":[{\"\"role\"\":\"\"user\"\",\"\"content\"\":\"\"Say hi\"\"}]}\")"
+    ]
+  }
+}

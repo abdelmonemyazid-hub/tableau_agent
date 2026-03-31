@@ -1,0 +1,166 @@
+[
+  {
+    "id": "TC-01",
+    "description": "Bar chart simple — dimension + measure explicites",
+    "fields": [
+      {"name": "Region",   "type": "string", "role": "dimension"},
+      {"name": "Sales",    "type": "float",  "role": "measure"},
+      {"name": "Profit",   "type": "float",  "role": "measure"}
+    ],
+    "question": "Show me sales by region",
+    "expected": {
+      "viz_type": "bar",
+      "columns":  ["Region"],
+      "rows":     ["Sales"]
+    },
+    "rule_triggered": "RULE 7 — DEFAULT"
+  },
+  {
+    "id": "TC-02",
+    "description": "Line chart — champ date présent + mot-clé temporel",
+    "fields": [
+      {"name": "Order Date", "type": "date",   "role": "dimension"},
+      {"name": "Sales",      "type": "float",  "role": "measure"},
+      {"name": "Category",   "type": "string", "role": "dimension"}
+    ],
+    "question": "Évolution des ventes par mois et par catégorie",
+    "expected": {
+      "viz_type": "line",
+      "columns":  ["Order Date"],
+      "rows":     ["Sales"],
+      "color":    "Category"
+    },
+    "rule_triggered": "RULE 1 — TEMPORAL"
+  },
+  {
+    "id": "TC-03",
+    "description": "Pie chart — mot-clé répartition",
+    "fields": [
+      {"name": "Segment",  "type": "string", "role": "dimension"},
+      {"name": "Sales",    "type": "float",  "role": "measure"}
+    ],
+    "question": "Répartition des ventes par segment client",
+    "expected": {
+      "viz_type": "pie",
+      "columns":  ["Segment"],
+      "rows":     ["Sales"]
+    },
+    "rule_triggered": "RULE 2 — PROPORTION"
+  },
+  {
+    "id": "TC-04",
+    "description": "Scatter — corrélation entre deux mesures",
+    "fields": [
+      {"name": "Sales",    "type": "float",  "role": "measure"},
+      {"name": "Profit",   "type": "float",  "role": "measure"},
+      {"name": "Category", "type": "string", "role": "dimension"}
+    ],
+    "question": "Corrélation entre ventes et profit par catégorie",
+    "expected": {
+      "viz_type": "scatter",
+      "columns":  ["Sales"],
+      "rows":     ["Profit"],
+      "color":    "Category"
+    },
+    "rule_triggered": "RULE 3 — CORRELATION"
+  },
+  {
+    "id": "TC-05",
+    "description": "Bar avec filtre — valeur explicite dans la question",
+    "fields": [
+      {"name": "Region",   "type": "string", "role": "dimension"},
+      {"name": "Sales",    "type": "float",  "role": "measure"},
+      {"name": "Category", "type": "string", "role": "dimension"}
+    ],
+    "question": "Ventes par région pour la catégorie Technology uniquement",
+    "expected": {
+      "viz_type": "bar",
+      "columns":  ["Region"],
+      "rows":     ["Sales"],
+      "filter":   {"field": "Category", "values": ["Technology"]}
+    },
+    "rule_triggered": "RULE 7 — DEFAULT + filter"
+  },
+  {
+    "id": "TC-06",
+    "description": "Text / crosstab — mot-clé tableau",
+    "fields": [
+      {"name": "Customer Name", "type": "string", "role": "dimension"},
+      {"name": "Order Date",    "type": "date",   "role": "dimension"},
+      {"name": "Sales",         "type": "float",  "role": "measure"},
+      {"name": "Profit",        "type": "float",  "role": "measure"}
+    ],
+    "question": "Tableau détaillé des commandes par client",
+    "expected": {
+      "viz_type": "text",
+      "columns":  ["Customer Name", "Order Date"],
+      "rows":     ["Sales", "Profit"]
+    },
+    "rule_triggered": "RULE 5 — DETAILED TABLE"
+  },
+  {
+    "id": "TC-07",
+    "description": "Bubble chart — trois encodages visuels",
+    "fields": [
+      {"name": "Category", "type": "string",  "role": "dimension"},
+      {"name": "Sales",    "type": "float",   "role": "measure"},
+      {"name": "Profit",   "type": "float",   "role": "measure"},
+      {"name": "Quantity", "type": "integer", "role": "measure"}
+    ],
+    "question": "Bulles : catégories en X, ventes en Y, taille = quantité, couleur = profit",
+    "expected": {
+      "viz_type": "bubble",
+      "columns":  ["Category"],
+      "rows":     ["Sales"],
+      "color":    "Profit",
+      "size":     "Quantity"
+    },
+    "rule_triggered": "RULE 3 — CORRELATION (bubble)"
+  },
+  {
+    "id": "TC-08",
+    "description": "Question ambiguë — aucun type ni dimension mentionné",
+    "fields": [
+      {"name": "Sub-Category", "type": "string", "role": "dimension"},
+      {"name": "Profit",       "type": "float",  "role": "measure"}
+    ],
+    "question": "Compare les profits",
+    "expected": {
+      "viz_type": "bar",
+      "columns":  ["Sub-Category"],
+      "rows":     ["Profit"]
+    },
+    "rule_triggered": "RULE 7 — DEFAULT (fallback R5)"
+  },
+  {
+    "id": "TC-09",
+    "description": "Piège : champ date présent mais question NON temporelle → bar",
+    "fields": [
+      {"name": "Order Date",    "type": "date",   "role": "dimension"},
+      {"name": "Ship Mode",     "type": "string", "role": "dimension"},
+      {"name": "Sales",         "type": "float",  "role": "measure"}
+    ],
+    "question": "Comparer les ventes par mode de livraison",
+    "expected": {
+      "viz_type": "bar",
+      "columns":  ["Ship Mode"],
+      "rows":     ["Sales"]
+    },
+    "rule_triggered": "RULE 7 — DEFAULT (date field ignoré car pas de mot temporel)"
+  },
+  {
+    "id": "TC-10",
+    "description": "Piège anti-hallucination : champ inexistant dans la question",
+    "fields": [
+      {"name": "Region",  "type": "string", "role": "dimension"},
+      {"name": "Sales",   "type": "float",  "role": "measure"}
+    ],
+    "question": "Ventes par ville",
+    "expected": {
+      "viz_type": "bar",
+      "columns":  ["Region"],
+      "rows":     ["Sales"]
+    },
+    "rule_triggered": "RULE 7 — DEFAULT + R1 (City n'existe pas → fallback sur Region)"
+  }
+]

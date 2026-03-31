@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Viz Agent</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ── En-tête ──────────────────────────────────────────────────── -->
+  <header>
+    <h1>Viz Agent</h1>
+    <span id="status-dot" title="Statut backend"></span>
+  </header>
+
+  <!-- ── Badges des champs disponibles ────────────────────────────── -->
+  <div id="fields-section">
+    <span class="section-label">Champs détectés</span>
+    <div id="fields-badges"></div>
+  </div>
+
+  <!-- ── Saisie de la question ─────────────────────────────────────── -->
+  <div id="question-container">
+    <textarea
+      id="question-input"
+      placeholder="Ex : Montre l'évolution des ventes par mois et par catégorie..."
+      autocomplete="off"
+      spellcheck="false"
+    ></textarea>
+    <div id="btn-group">
+      <button id="submit-btn">Générer</button>
+      <button id="clear-btn" class="secondary">Reset</button>
+    </div>
+  </div>
+
+  <!-- ── Barre de statut ───────────────────────────────────────────── -->
+  <div id="status-bar" class="idle">Initialisation...</div>
+
+  <!-- ── Carte résultat ────────────────────────────────────────────── -->
+  <div id="result-card" class="hidden"></div>
+
+  <!-- ── Historique ────────────────────────────────────────────────── -->
+  <details id="history-section">
+    <summary>Historique des questions</summary>
+    <ul id="history-list"></ul>
+  </details>
+
+  <!-- ── Debug JSON ────────────────────────────────────────────────── -->
+  <details id="debug-section">
+    <summary id="debug-toggle">▸ JSON d'intention (debug)</summary>
+    <pre id="debug-content"></pre>
+  </details>
+
+  <!-- Tableau Extensions API -->
+  <script src="tableau.extensions.1.latest.js"></script>
+  <!-- Logique principale -->
+  <script src="viz_agent.js"></script>
+</body>
+</html>

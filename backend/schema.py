@@ -15,35 +15,48 @@ SUPPORTED_VIZ_TYPES = Literal[
 STEP_STATUS = Literal["pending", "in_progress", "success", "error"]
 
 
+# ── Reasoning (OpenRouter) ─────────────────────────────────────────────────
+
+class ReasoningStep(BaseModel):
+    """Un pas individuel du raisonnement retourné par le modèle."""
+    type:     str                  # "thinking" | "text"
+    thinking: Optional[str] = None # contenu du raisonnement interne
+    text:     Optional[str] = None # contenu textuel (si type="text")
+
+
+class ReasoningTrace(BaseModel):
+    """
+    Trace de raisonnement complète retournée par OpenRouter (reasoning_details).
+    Affichée dans le Flow Monitor pour expliquer les décisions du LLM.
+    """
+    steps:        list[ReasoningStep] = Field(default_factory=list)
+    thinking_text: Optional[str]      = None  # concaténation de tous les steps "thinking"
+    tokens_used:  Optional[int]       = None  # tokens de raisonnement utilisés
+
+
 # ── Monitoring : trace d'exécution ─────────────────────────────────────────
 
 class StepTrace(BaseModel):
-    """Trace d'une étape du pipeline agentique."""
     id:          str
     label:       str
-    status:      STEP_STATUS        = "pending"
-    duration_ms: Optional[float]    = None   # None si pas encore terminé
-    error:       Optional[str]      = None   # message d'erreur brut si status="error"
+    status:      STEP_STATUS     = "pending"
+    duration_ms: Optional[float] = None
+    error:       Optional[str]   = None
 
 
 class ExecutionTrace(BaseModel):
-    """
-    Trace complète du pipeline — incluse dans chaque VizIntentResponse.
-    Steps mesurés côté backend : llm_processing, command_mapping.
-    Steps mesurés côté frontend JS : metadata_extraction, request_dispatch, viz_execution.
-    """
-    steps:            list[StepTrace]
-    total_duration_ms: Optional[float] = None
-    llm_raw_response: Optional[str]    = None   # réponse brute du LLM (debug)
-    attempts:         int              = 1       # nombre de tentatives Ollama
+    steps:             list[StepTrace]
+    total_duration_ms: Optional[float]   = None
+    llm_raw_response:  Optional[str]     = None
+    attempts:          int               = 1
+    reasoning:         Optional[ReasoningTrace] = None  # raisonnement LLM (OpenRouter)
 
 
 def make_default_trace() -> ExecutionTrace:
-    """Trace initiale avec les 5 étapes en 'pending' (remplie progressivement)."""
     return ExecutionTrace(steps=[
         StepTrace(id="metadata_extraction", label="Metadata Extraction"),
         StepTrace(id="request_dispatch",    label="Request Dispatch"),
-        StepTrace(id="llm_processing",      label="LLM Processing (Ollama)"),
+        StepTrace(id="llm_processing",      label="LLM Processing"),
         StepTrace(id="command_mapping",     label="Command Mapping"),
         StepTrace(id="viz_execution",       label="Viz Execution"),
     ])
@@ -52,32 +65,44 @@ def make_default_trace() -> ExecutionTrace:
 # ── Modèles principaux ─────────────────────────────────────────────────────
 
 class FilterIntent(BaseModel):
-    """Sous-modèle strict pour le filtre — évite les dicts libres non validés."""
     field:  str
     values: list[str] = Field(..., min_length=1)
 
 
 class VizIntentRequest(BaseModel):
-    """Payload envoyé par l'extension au backend."""
+    """Payload de la première question (génération initiale)."""
     question:   str = Field(..., min_length=3, max_length=500)
     fields:     list[dict]
     sheet_name: str = Field(default="Zone IA")
 
 
+class VizRefinementRequest(BaseModel):
+    """
+    Payload pour raffiner le résultat précédent ("Are you sure?", correction).
+    Le session_id est retourné par /generate-viz et permet de conserver
+    le contexte de raisonnement du LLM pour un suivi cohérent.
+    """
+    session_id: str  = Field(..., min_length=1)
+    feedback:   str  = Field(..., min_length=3, max_length=500,
+                             description="Ex: 'Use a line chart instead' ou 'Are you sure?'")
+    fields:     list[dict]  # re-fourni pour re-valider les champs après correction
+
+
 class VizIntentResponse(BaseModel):
     """
-    JSON d'intention retourné par le LLM, validé et enrichi par le backend.
-    Consommé par l'extension JS pour piloter Tableau.
+    JSON d'intention retourné par le LLM, validé et enrichi.
+    Inclut session_id pour les appels de raffinement ultérieurs.
     """
     viz_type:          SUPPORTED_VIZ_TYPES
-    columns:           list[str]              = Field(default_factory=list)
-    rows:              list[str]              = Field(default_factory=list)
-    color:             Optional[str]          = None
-    size:              Optional[str]          = None
-    filter:            Optional[FilterIntent] = None
-    title:             Optional[str]          = None
-    tableau_mark_type: Optional[str]          = None   # enrichi par main.py
-    execution_trace:   Optional[ExecutionTrace] = None  # monitoring pipeline
+    columns:           list[str]               = Field(default_factory=list)
+    rows:              list[str]               = Field(default_factory=list)
+    color:             Optional[str]           = None
+    size:              Optional[str]           = None
+    filter:            Optional[FilterIntent]  = None
+    title:             Optional[str]           = None
+    tableau_mark_type: Optional[str]           = None
+    session_id:        Optional[str]           = None  # pour /refine-viz
+    execution_trace:   Optional[ExecutionTrace] = None
 
     @field_validator("columns", "rows")
     @classmethod
@@ -93,5 +118,5 @@ class VizIntentResponse(BaseModel):
 
 class ErrorResponse(BaseModel):
     error:  str
-    detail: Optional[str]          = None
-    trace:  Optional[ExecutionTrace] = None   # trace partielle en cas d'erreur
+    detail: Optional[str]            = None
+    trace:  Optional[ExecutionTrace] = None

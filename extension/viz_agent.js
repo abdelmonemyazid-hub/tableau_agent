@@ -1,19 +1,12 @@
 /**
- * viz_agent.js — Extension Tableau Text-to-Viz
+ * viz_agent.js — Extension Tableau Text-to-Viz avec Pipeline Monitor
  *
- * Contrainte Extensions API v1 (dashboard extension) :
- *   ✓ Lecture des champs       : worksheet.getDataSourcesAsync()
- *   ✓ Filtres                  : worksheet.applyFilterAsync() / clearFilterAsync()
- *   ✓ Paramètres               : parameter.changeValueAsync()
- *   ✗ Modification des étagères: addColumnsAsync / clearRowsAsync → N'EXISTE PAS
- *   ✗ Changement de type de viz: changeVizTypeAsync           → N'EXISTE PAS
- *
- * Stratégie applyIntent :
- *   1. Applique le filtre si présent (API disponible)
- *   2. Tente de passer les champs via des paramètres Tableau pré-configurés
- *      (p_VizAgent_Column, p_VizAgent_Row, p_VizAgent_Color)
- *   3. Affiche une carte récapitulatif pour permettre à l'utilisateur
- *      d'appliquer manuellement ce que l'API ne peut pas faire
+ * Pipeline agentique surveillé (5 étapes) :
+ *   Step 1 — Metadata Extraction  : JS  → worksheet.getDataSourcesAsync()
+ *   Step 2 — Request Dispatch     : JS  → fetch() vers FastAPI
+ *   Step 3 — LLM Processing       : PY  → Ollama /api/chat (timing retourné par backend)
+ *   Step 4 — Command Mapping      : PY  → validation JSON + to_tableau_mark_type()
+ *   Step 5 — Viz Execution        : JS  → applyFilterAsync() + changeValueAsync()
  */
 
 "use strict";
@@ -22,32 +15,112 @@
 const CONFIG = {
   BACKEND_URL:  "http://localhost:8000",
   TARGET_SHEET: "Zone IA",
-  // Noms des paramètres Tableau à créer dans le classeur pour le contrôle automatique
-  // Si absents, l'extension affiche les suggestions sans les appliquer
   PARAM_COLUMN: "p_VizAgent_Column",
   PARAM_ROW:    "p_VizAgent_Row",
   PARAM_COLOR:  "p_VizAgent_Color",
   MAX_HISTORY:  10,
 };
 
-// ── État de l'extension ────────────────────────────────────────────────────
+// ── État ───────────────────────────────────────────────────────────────────
 const state = {
   initialized: false,
-  lastFields:  [],          // cache des champs extraits
+  lastFields:  [],
   history:     loadHistory(),
 };
 
 // ── Références DOM ─────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
-const questionInput  = $("question-input");
-const submitBtn      = $("submit-btn");
-const clearBtn       = $("clear-btn");
-const statusBar      = $("status-bar");
-const resultCard     = $("result-card");
-const historyList    = $("history-list");
-const debugContent   = $("debug-content");
-const debugToggle    = $("debug-toggle");
-const fieldsBadges   = $("fields-badges");
+const questionInput = $("question-input");
+const submitBtn     = $("submit-btn");
+const clearBtn      = $("clear-btn");
+const statusBar     = $("status-bar");
+const resultCard    = $("result-card");
+const historyList   = $("history-list");
+const debugContent  = $("debug-content");
+const debugToggle   = $("debug-toggle");
+const fieldsBadges  = $("fields-badges");
+const pipelineEl    = $("pipeline");
+
+// ── Pipeline Monitor ───────────────────────────────────────────────────────
+const PIPELINE_STEPS = [
+  { id: "metadata_extraction", label: "Metadata Extraction",  icon: "⬡" },
+  { id: "request_dispatch",    label: "Request Dispatch",     icon: "⬡" },
+  { id: "llm_processing",      label: "LLM Processing",       icon: "⬡" },
+  { id: "command_mapping",     label: "Command Mapping",      icon: "⬡" },
+  { id: "viz_execution",       label: "Viz Execution",        icon: "⬡" },
+];
+
+// Initialise les 5 steps en "pending"
+function initPipeline() {
+  pipelineEl.innerHTML = PIPELINE_STEPS.map((s) => `
+    <div class="pipeline-step pending" id="step-${s.id}">
+      <div class="step-dot"></div>
+      <div class="step-body">
+        <span class="step-label">${s.label}</span>
+        <span class="step-badge" id="badge-${s.id}"></span>
+      </div>
+    </div>
+    <div class="step-connector" id="conn-${s.id}"></div>
+  `).join("");
+}
+
+// Met à jour le statut visuel d'un step
+// status : "pending" | "in_progress" | "success" | "error"
+// duration_ms : optionnel
+// error : message d'erreur optionnel
+function updateStep(stepId, status, { duration_ms = null, error = null } = {}) {
+  const el    = $(`step-${stepId}`);
+  const badge = $(`badge-${stepId}`);
+  const conn  = $(`conn-${stepId}`);
+  if (!el) return;
+
+  el.className = `pipeline-step ${status}`;
+
+  if (duration_ms !== null) {
+    badge.textContent = duration_ms < 1000
+      ? `${Math.round(duration_ms)}ms`
+      : `${(duration_ms / 1000).toFixed(1)}s`;
+    badge.className = "step-badge";
+  }
+
+  if (error) {
+    const errEl = el.querySelector(".step-error") ?? document.createElement("div");
+    errEl.className   = "step-error";
+    errEl.textContent = error;
+    el.querySelector(".step-body").appendChild(errEl);
+  }
+
+  // Colorier le connecteur selon le statut de l'étape précédente
+  if (conn) {
+    conn.className = `step-connector ${status === "success" ? "done" : ""}`;
+  }
+}
+
+// Applique une trace complète reçue du backend (steps 3 & 4)
+function applyBackendTrace(trace) {
+  if (!trace?.steps) return;
+  for (const step of trace.steps) {
+    // Ne pas écraser les steps JS (1, 2, 5) — déjà mis à jour localement
+    if (["metadata_extraction", "request_dispatch", "viz_execution"].includes(step.id)) continue;
+    updateStep(step.id, step.status, {
+      duration_ms: step.duration_ms,
+      error:       step.error,
+    });
+  }
+}
+
+// Applique une trace d'erreur partielle (quand le backend retourne 4xx/5xx)
+function applyErrorTrace(traceData) {
+  if (!traceData?.steps) return;
+  for (const step of traceData.steps) {
+    if (step.status === "error" || step.status === "success") {
+      updateStep(step.id, step.status, {
+        duration_ms: step.duration_ms,
+        error:       step.error,
+      });
+    }
+  }
+}
 
 // ── Utilitaires UI ─────────────────────────────────────────────────────────
 function setStatus(message, type = "idle") {
@@ -66,55 +139,44 @@ function showDebug(data) {
 }
 
 function showResultCard(intent) {
-  const applied   = [];
-  const manual    = [];
+  const applied = [];
+  const manual  = [];
 
-  if (intent._filtersApplied?.length) {
+  if (intent._filtersApplied?.length)
     applied.push(`Filtre : <strong>${intent._filtersApplied.join(", ")}</strong>`);
-  }
-  if (intent._paramsSet?.length) {
+  if (intent._paramsSet?.length)
     applied.push(`Paramètres : <strong>${intent._paramsSet.join(", ")}</strong>`);
-  }
-  if (intent.columns?.length) {
+  if (intent.columns?.length)
     manual.push(`Colonnes → <code>${intent.columns.join(", ")}</code>`);
-  }
-  if (intent.rows?.length) {
+  if (intent.rows?.length)
     manual.push(`Lignes → <code>${intent.rows.join(", ")}</code>`);
-  }
-  if (intent.viz_type) {
-    manual.push(`Type : <code>${intent.viz_type}</code> (mark: <code>${intent.tableau_mark_type}</code>)`);
-  }
-  if (intent.color) {
+  if (intent.viz_type)
+    manual.push(`Type : <code>${intent.viz_type}</code>`);
+  if (intent.color)
     manual.push(`Couleur → <code>${intent.color}</code>`);
-  }
 
   let html = "";
-  if (applied.length) {
+  if (applied.length)
     html += `<div class="rc-section rc-applied">
       <span class="rc-label">Appliqué automatiquement</span>
       <ul>${applied.map((a) => `<li>${a}</li>`).join("")}</ul>
     </div>`;
-  }
-  if (manual.length) {
+  if (manual.length)
     html += `<div class="rc-section rc-manual">
-      <span class="rc-label">À appliquer manuellement sur "Zone IA"</span>
+      <span class="rc-label">À appliquer sur "Zone IA"</span>
       <ul>${manual.map((m) => `<li>${m}</li>`).join("")}</ul>
     </div>`;
-  }
 
-  resultCard.innerHTML  = html;
+  resultCard.innerHTML = html;
   resultCard.classList.remove("hidden");
 }
 
 function renderFieldBadges(fields) {
-  const dims = fields.filter((f) => f.role === "dimension");
-  const meas = fields.filter((f) => f.role === "measure");
   const badge = (f, cls) =>
     `<span class="badge badge-${cls}" title="${f.type}">${f.name}</span>`;
-
   fieldsBadges.innerHTML =
-    dims.map((f) => badge(f, "dim")).join("") +
-    meas.map((f) => badge(f, "mea")).join("");
+    fields.filter((f) => f.role === "dimension").map((f) => badge(f, "dim")).join("") +
+    fields.filter((f) => f.role === "measure").map((f) => badge(f, "mea")).join("");
 }
 
 function renderHistory() {
@@ -123,12 +185,8 @@ function renderHistory() {
     return;
   }
   historyList.innerHTML = state.history
-    .map(
-      (q, i) =>
-        `<li class="history-item" data-index="${i}" title="${q}">${q}</li>`
-    )
+    .map((q, i) => `<li class="history-item" data-index="${i}" title="${q}">${q}</li>`)
     .join("");
-
   historyList.querySelectorAll(".history-item").forEach((li) => {
     li.addEventListener("click", () => {
       questionInput.value = li.title;
@@ -142,61 +200,45 @@ debugToggle.addEventListener("click", () => {
   debugToggle.textContent = (visible ? "▾" : "▸") + " JSON d'intention (debug)";
 });
 
-// ── Historique (localStorage) ──────────────────────────────────────────────
+// ── Historique ─────────────────────────────────────────────────────────────
 function loadHistory() {
-  try {
-    return JSON.parse(localStorage.getItem("vizagent_history") ?? "[]");
-  } catch {
-    return [];
-  }
+  try { return JSON.parse(localStorage.getItem("vizagent_history") ?? "[]"); }
+  catch { return []; }
 }
 
 function saveHistory(question) {
-  state.history = [question, ...state.history.filter((q) => q !== question)].slice(
-    0,
-    CONFIG.MAX_HISTORY
-  );
-  try {
-    localStorage.setItem("vizagent_history", JSON.stringify(state.history));
-  } catch {
-    /* localStorage indisponible dans certains contextes Tableau — silencieux */
-  }
+  state.history = [question, ...state.history.filter((q) => q !== question)].slice(0, CONFIG.MAX_HISTORY);
+  try { localStorage.setItem("vizagent_history", JSON.stringify(state.history)); }
+  catch { /* silencieux */ }
   renderHistory();
 }
 
-// ── 1. Initialisation Tableau Extensions API ───────────────────────────────
+// ── Initialisation Tableau Extensions API ──────────────────────────────────
 tableau.extensions.initializeAsync().then(async () => {
+  initPipeline();
   setStatus("Connexion au backend...", "loading");
 
-  const backendOk = await checkBackend();
-  if (!backendOk) return;
+  if (!await checkBackend()) return;
 
   state.initialized = true;
   setStatus("Prêt.", "idle");
   renderHistory();
 
-  // Pré-charger les champs de "Zone IA" au démarrage
   try {
     state.lastFields = await extractFields();
     renderFieldBadges(state.lastFields);
-  } catch {
-    /* Non bloquant — les champs seront extraits à la soumission */
-  }
+  } catch { /* non bloquant */ }
 
   submitBtn.addEventListener("click", handleSubmit);
   clearBtn.addEventListener("click", handleClear);
-
   questionInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      handleSubmit();
-    }
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSubmit(); }
   });
 }).catch((err) => {
   setStatus(`Erreur d'initialisation Tableau : ${err.message}`, "error");
 });
 
-// ── Vérification santé du backend ──────────────────────────────────────────
+// ── Santé backend ──────────────────────────────────────────────────────────
 async function checkBackend() {
   try {
     const res = await fetch(`${CONFIG.BACKEND_URL}/health`);
@@ -207,87 +249,60 @@ async function checkBackend() {
     }
     return true;
   } catch {
-    setStatus(
-      `Backend inaccessible. Lancer : uvicorn main:app --port 8000`,
-      "error"
-    );
+    setStatus("Backend inaccessible. Lancer : uvicorn main:app --port 8000", "error");
     return false;
   }
 }
 
-// ── 2. Extraction des métadonnées ──────────────────────────────────────────
-// CORRECTION BUG #1 : getDataSourcesAsync() s'appelle sur un Worksheet,
-// pas sur le Dashboard.
+// ── Step 1 : Extraction des métadonnées ────────────────────────────────────
 async function extractFields() {
   const sheet = getTargetSheet();
   const dataSources = await sheet.getDataSourcesAsync();
-
   if (!dataSources.length) throw new Error("Aucune source de données sur la feuille « Zone IA ».");
-
   const ds = dataSources[0];
-
-  // CORRECTION BUG #4 : f.role est un enum FieldRoleType, pas une string.
-  // On normalise en minuscules pour correspondre au schéma backend.
   return ds.fields
     .filter((f) => !f.isHidden)
     .map((f) => ({
       name: f.name,
-      type: f.dataType?.toLowerCase() ?? "string",   // enum → string
-      role: f.role?.toLowerCase() ?? "dimension",    // enum → "dimension"|"measure"
+      type: f.dataType?.toLowerCase() ?? "string",
+      role: f.role?.toLowerCase() ?? "dimension",
     }));
 }
 
-// ── Utilitaire : trouver la feuille cible ──────────────────────────────────
 function getTargetSheet() {
-  const sheet = tableau.extensions.dashboardContent.dashboard.worksheets.find(
-    (ws) => ws.name === CONFIG.TARGET_SHEET
+  const sheet = tableau.extensions.dashboardContent.dashboard.worksheets
+    .find((ws) => ws.name === CONFIG.TARGET_SHEET);
+  if (!sheet) throw new Error(
+    `Feuille "${CONFIG.TARGET_SHEET}" introuvable dans ce dashboard.`
   );
-  if (!sheet) {
-    throw new Error(
-      `Feuille "${CONFIG.TARGET_SHEET}" introuvable. ` +
-      `Vérifier qu'une feuille nommée exactement "${CONFIG.TARGET_SHEET}" est présente dans ce dashboard.`
-    );
-  }
   return sheet;
 }
 
-// ── 3. Appel backend FastAPI ───────────────────────────────────────────────
+// ── Step 2 : Appel backend FastAPI ─────────────────────────────────────────
 async function callBackend(question, fields) {
   const response = await fetch(`${CONFIG.BACKEND_URL}/generate-viz`, {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
-    body:    JSON.stringify({
-      question,
-      fields,
-      sheet_name: CONFIG.TARGET_SHEET,
-    }),
+    body:    JSON.stringify({ question, fields, sheet_name: CONFIG.TARGET_SHEET }),
   });
 
+  const body = await response.json().catch(() => ({}));
+
   if (!response.ok) {
-    const body = await response.json().catch(() => ({}));
+    // Récupérer la trace partielle si disponible pour mise à jour du pipeline
+    if (body.detail?.trace) applyErrorTrace(body.detail.trace);
     throw new Error(body.detail?.error ?? `Erreur backend HTTP ${response.status}`);
   }
 
-  return response.json();
+  return body;
 }
 
-// ── 4. Application du JSON d'intention sur Tableau ─────────────────────────
-//
-// Stratégie en 3 niveaux :
-//   Niveau 1 — Filtre    : applyFilterAsync()        → toujours disponible
-//   Niveau 2 — Paramètres: parameter.changeValueAsync() → si paramètres configurés
-//   Niveau 3 — Manuel    : affichage récapitulatif    → fallback universel
-//
-// CORRECTION BUGS #2 & #3 : clearColumnsAsync, addColumnsAsync,
-// clearRowsAsync, addRowsAsync, changeVizTypeAsync N'EXISTENT PAS
-// dans l'Extensions API v1. Remplacés par l'approche ci-dessus.
+// ── Step 5 : Application de l'intention sur Tableau ────────────────────────
 async function applyIntent(intent) {
   const sheet = getTargetSheet();
   intent._filtersApplied = [];
   intent._paramsSet      = [];
 
-  // ── Niveau 1 : Filtres ─────────────────────────────────────────────────
-  // D'abord on retire les anciens filtres de l'agent pour repartir proprement
   await clearAgentFilters(sheet);
 
   if (intent.filter?.field && intent.filter?.values?.length) {
@@ -296,87 +311,97 @@ async function applyIntent(intent) {
       intent.filter.values,
       tableau.FilterUpdateType.Replace
     );
-    intent._filtersApplied.push(
-      `${intent.filter.field} = ${intent.filter.values.join(", ")}`
-    );
+    intent._filtersApplied.push(`${intent.filter.field} = ${intent.filter.values.join(", ")}`);
   }
-
-  // ── Niveau 2 : Paramètres ──────────────────────────────────────────────
-  // Tente de renseigner les paramètres pré-configurés dans le classeur Tableau.
-  // Si le paramètre n'existe pas, on passe silencieusement au niveau 3.
-  const paramMap = {
-    [CONFIG.PARAM_COLUMN]: intent.columns?.[0] ?? null,
-    [CONFIG.PARAM_ROW]:    intent.rows?.[0]    ?? null,
-    [CONFIG.PARAM_COLOR]:  intent.color        ?? null,
-  };
 
   try {
     const parameters = await tableau.extensions.dashboardContent.dashboard.getParametersAsync();
-    const paramIndex  = Object.fromEntries(parameters.map((p) => [p.name, p]));
-
-    for (const [paramName, value] of Object.entries(paramMap)) {
-      if (value && paramIndex[paramName]) {
-        await paramIndex[paramName].changeValueAsync(value);
-        intent._paramsSet.push(`${paramName} = "${value}"`);
+    const paramIndex = Object.fromEntries(parameters.map((p) => [p.name, p]));
+    const paramMap   = {
+      [CONFIG.PARAM_COLUMN]: intent.columns?.[0] ?? null,
+      [CONFIG.PARAM_ROW]:    intent.rows?.[0]    ?? null,
+      [CONFIG.PARAM_COLOR]:  intent.color        ?? null,
+    };
+    for (const [name, value] of Object.entries(paramMap)) {
+      if (value && paramIndex[name]) {
+        await paramIndex[name].changeValueAsync(value);
+        intent._paramsSet.push(`${name} = "${value}"`);
       }
     }
-  } catch {
-    /* Les paramètres sont optionnels — pas bloquant */
-  }
+  } catch { /* paramètres optionnels */ }
 
   return intent;
 }
 
-// ── Nettoyage des filtres précédents de l'agent ────────────────────────────
-// On mémorise les champs filtrés lors de la dernière exécution pour pouvoir
-// les retirer proprement à la prochaine.
 const _lastFilteredFields = new Set();
-
 async function clearAgentFilters(sheet) {
   for (const field of _lastFilteredFields) {
-    try {
-      await sheet.clearFilterAsync(field);
-    } catch {
-      /* Le champ n'était peut-être plus filtré */
-    }
+    try { await sheet.clearFilterAsync(field); } catch { /* silencieux */ }
   }
   _lastFilteredFields.clear();
 }
 
-// ── Handler : Générer ──────────────────────────────────────────────────────
+// ── Handler principal ──────────────────────────────────────────────────────
 async function handleSubmit() {
   const question = questionInput.value.trim();
-  if (!question) {
-    setStatus("Saisissez une question.", "error");
-    return;
-  }
+  if (!question) { setStatus("Saisissez une question.", "error"); return; }
 
   setLoading(true);
   resultCard.classList.add("hidden");
+  initPipeline();   // remet tous les steps à "pending"
+
+  let t_start, t_end;
 
   try {
-    // Étape 1 — Extraction des champs
+    // ── Step 1 : Metadata Extraction ──────────────────────────────────────
+    updateStep("metadata_extraction", "in_progress");
     setStatus("Extraction des métadonnées...", "loading");
+    t_start = performance.now();
     state.lastFields = await extractFields();
+    t_end = performance.now();
     renderFieldBadges(state.lastFields);
+    updateStep("metadata_extraction", "success", { duration_ms: t_end - t_start });
 
-    // Étape 2 — Appel LLM
-    setStatus("Consultation du modèle IA (peut prendre ~5s)...", "loading");
+    // ── Step 2 : Request Dispatch ─────────────────────────────────────────
+    updateStep("request_dispatch", "in_progress");
+    setStatus("Envoi au backend...", "loading");
+    t_start = performance.now();
+
+    // ── Steps 3 & 4 : LLM + Mapping (backend) ────────────────────────────
+    // On marque step 3 "in_progress" dès l'envoi — le backend mettra à jour via la trace
+    updateStep("llm_processing", "in_progress");
+    setStatus("Consultation du modèle IA...", "loading");
+
     const intent = await callBackend(question, state.lastFields);
+    t_end = performance.now();
+
+    updateStep("request_dispatch", "success", { duration_ms: t_end - t_start });
     showDebug(intent);
 
-    // Étape 3 — Application
-    setStatus("Application de l'intention...", "loading");
-    const enrichedIntent = await applyIntent(intent);
+    // Appliquer la trace backend (steps 3 & 4 avec vrais timings)
+    applyBackendTrace(intent.execution_trace);
 
-    // Mémoriser les champs filtrés pour le prochain nettoyage
+    // ── Step 5 : Viz Execution ────────────────────────────────────────────
+    updateStep("viz_execution", "in_progress");
+    setStatus("Application sur Tableau...", "loading");
+    t_start = performance.now();
+    const enrichedIntent = await applyIntent(intent);
+    t_end = performance.now();
+    updateStep("viz_execution", "success", { duration_ms: t_end - t_start });
+
     if (intent.filter?.field) _lastFilteredFields.add(intent.filter.field);
 
     showResultCard(enrichedIntent);
     saveHistory(question);
-    setStatus(`Intention "${intent.viz_type}" traitée.`, "success");
+    setStatus(`"${intent.viz_type}" — pipeline complété.`, "success");
 
   } catch (err) {
+    // L'étape en cours passe en error — les suivantes restent pending
+    const activeStep = pipelineEl.querySelector(".pipeline-step.in_progress");
+    if (activeStep) {
+      const stepId = activeStep.id.replace("step-", "");
+      updateStep(stepId, "error", { error: err.message });
+    }
     setStatus(`Erreur : ${err.message}`, "error");
     console.error("[VizAgent]", err);
   } finally {
@@ -384,19 +409,16 @@ async function handleSubmit() {
   }
 }
 
-// ── Handler : Réinitialiser ────────────────────────────────────────────────
+// ── Handler : Reset ────────────────────────────────────────────────────────
 async function handleClear() {
-  questionInput.value = "";
+  questionInput.value      = "";
   resultCard.classList.add("hidden");
   debugContent.textContent = "";
   fieldsBadges.innerHTML   = "";
+  initPipeline();
   setStatus("Réinitialisé.", "idle");
-
-  // Retirer les filtres de l'agent
   try {
     const sheet = getTargetSheet();
     await clearAgentFilters(sheet);
-  } catch {
-    /* Non bloquant */
-  }
+  } catch { /* non bloquant */ }
 }

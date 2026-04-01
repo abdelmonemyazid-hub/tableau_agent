@@ -42,6 +42,8 @@ class StepTrace(BaseModel):
     status:      STEP_STATUS     = "pending"
     duration_ms: Optional[float] = None
     error:       Optional[str]   = None
+    input:       Optional[str]   = None   # IO Inspector — résumé de l'entrée
+    output:      Optional[str]   = None   # IO Inspector — résumé de la sortie
 
 
 class ExecutionTrace(BaseModel):

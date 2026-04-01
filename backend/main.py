@@ -2,22 +2,28 @@
 Serveur FastAPI — point d'entrée du backend viz_agent_v1.
 Lancer avec : uvicorn main:app --reload --port 8000
 
-Chargement de la clé API :
-  Créer un fichier .env à la racine du dossier backend :
-    OPENROUTER_API_KEY=sk-or-xxxxxxxxxxxxxxxx
-  Ou exporter la variable avant de lancer uvicorn :
-    set OPENROUTER_API_KEY=sk-or-xxxxxxxxxxxxxxxx  (Windows)
+Endpoints principaux :
+  POST /generate-viz   — question → VizIntentResponse + session_id
+  POST /refine-viz     — feedback → VizIntentResponse (session préservée)
+  POST /setup          — fields   → formules Tableau CASE à créer
+  GET  /health         — vérification clé API + connectivité OpenRouter
+  GET  /monitoring     — dashboard de monitoring (Airflow-style)
+  GET  /api/runs       — liste des runs récents (JSON)
+  GET  /api/runs/{id}  — détail d'un run avec IO par étape
 """
 
 import logging
 import os
+from datetime import datetime, timezone
+from pathlib import Path
+
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import ValidationError
 
-# Charger .env si présent (doit être avant les imports qui lisent os.environ)
 load_dotenv()
 
 from schema import (
@@ -27,10 +33,16 @@ from schema import (
 from openrouter_service import (
     generate_viz_with_reasoning,
     refine_viz_with_reasoning,
+    OpenRouterResult,
     OPENROUTER_MODEL,
     OPENROUTER_URL,
 )
 from viz_mapper import to_tableau_mark_type
+from setup_helper import build_setup_guide
+from run_store import (
+    RunRecord, StepRecord,
+    record_run, get_all_runs, get_run, make_run_id,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,10 +50,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_MONITORING_HTML = Path(__file__).parent / "monitoring.html"
+
 app = FastAPI(
     title="Viz Agent — Text-to-Viz Backend",
     version="2.0.0",
-    description="Text-to-Viz avec raisonnement OpenRouter (Qwen).",
+    description="Text-to-Viz avec raisonnement OpenRouter (Qwen) + monitoring dashboard.",
 )
 
 app.add_middleware(
@@ -65,34 +79,162 @@ def _fail_trace(trace: ExecutionTrace, step_id: str, error: str) -> ExecutionTra
     return trace
 
 
-def _build_response(result, trace: ExecutionTrace) -> VizIntentResponse:
-    """Assemble la réponse finale à partir d'un OpenRouterResult."""
-    # Step 3 terminé
-    llm_step             = _step(trace, "llm_processing")
-    llm_step.status      = "success"
-    llm_step.duration_ms = result.llm_duration_ms
+def _build_response(
+    result: OpenRouterResult,
+    trace: ExecutionTrace,
+    request_fields: list[dict],
+) -> VizIntentResponse:
+    """Assemble la réponse finale et peuple les champs IO de chaque step."""
+    intent = result.intent
 
-    # Step 4 terminé
-    map_step             = _step(trace, "command_mapping")
-    map_step.status      = "success"
-    map_step.duration_ms = result.map_duration_ms
+    # ── Step 1 : Metadata Extraction (IO inféré des champs reçus) ─────────
+    meta = _step(trace, "metadata_extraction")
+    dims = [f["name"] for f in request_fields if f.get("role") == "dimension"]
+    meas = [f["name"] for f in request_fields if f.get("role") == "measure"]
+    meta.input  = "Tableau worksheet — Zone IA"
+    meta.output = (
+        f"{len(request_fields)} fields\n"
+        f"Dimensions : {', '.join(dims) or '—'}\n"
+        f"Measures   : {', '.join(meas) or '—'}"
+    )
 
-    # Reasoning dans la trace
+    # ── Step 2 : Request Dispatch ──────────────────────────────────────────
+    disp = _step(trace, "request_dispatch")
+    disp.input  = f"{len(request_fields)} fields dispatched to FastAPI"
+    disp.output = "Request received — forwarding to OpenRouter"
+
+    # ── Step 3 : LLM Processing ────────────────────────────────────────────
+    llm             = _step(trace, "llm_processing")
+    llm.status      = "success"
+    llm.duration_ms = result.llm_duration_ms
+    llm.input       = result.prompt_preview
+    thinking        = result.reasoning.thinking_text if result.reasoning else None
+    thinking_preview = ""
+    if thinking:
+        thinking_preview = thinking[:400].replace("\n", " ")
+        if len(thinking) > 400:
+            thinking_preview += " …"
+    llm.output = (
+        f"viz_type → {intent.viz_type}"
+        + (f"\nReasoning : {thinking_preview}" if thinking_preview else "")
+    )
+
+    # ── Step 4 : Command Mapping ───────────────────────────────────────────
+    cmd             = _step(trace, "command_mapping")
+    cmd.status      = "success"
+    cmd.duration_ms = result.map_duration_ms
+    raw_preview     = (result.llm_raw or "")[:400]
+    if len(result.llm_raw or "") > 400:
+        raw_preview += " …"
+    cmd.input  = raw_preview
+    parts = [f"viz_type = {intent.viz_type}"]
+    if intent.columns: parts.append(f"columns  = {intent.columns}")
+    if intent.rows:    parts.append(f"rows     = {intent.rows}")
+    if intent.color:   parts.append(f"color    = {intent.color}")
+    if intent.size:    parts.append(f"size     = {intent.size}")
+    if intent.filter:  parts.append(f"filter   = {intent.filter.field} ∈ {intent.filter.values}")
+    if intent.title:   parts.append(f"title    = {intent.title}")
+    cmd.output = "\n".join(parts)
+
+    # ── Step 5 : Viz Execution (JS-side, inferred) ─────────────────────────
+    viz           = _step(trace, "viz_execution")
+    viz.input     = (
+        f"viz_type = {intent.viz_type}\n"
+        f"columns  = {intent.columns}\n"
+        f"rows     = {intent.rows}"
+    )
+    viz.output    = "Exécution côté extension Tableau (JS)"
+
+    # ── Méta ───────────────────────────────────────────────────────────────
     trace.reasoning        = result.reasoning
     trace.llm_raw_response = result.llm_raw[:800] if result.llm_raw else None
     trace.attempts         = result.attempts
 
-    intent = result.intent
     intent.tableau_mark_type = to_tableau_mark_type(intent.viz_type)
     intent.session_id        = result.session_id
     intent.execution_trace   = trace
     return intent
 
 
+# ── Run recording ──────────────────────────────────────────────────────────
+
+def _record_success(
+    result: OpenRouterResult,
+    intent: VizIntentResponse,
+    run_type: str,
+    question: str,
+    started_at: datetime,
+) -> None:
+    """Enregistre un run réussi dans le monitoring store."""
+    trace = intent.execution_trace
+    if not trace:
+        return
+    duration = (datetime.now(timezone.utc) - started_at).total_seconds() * 1000
+
+    steps = [
+        StepRecord(
+            id          = s.id,
+            label       = s.label,
+            status      = s.status,
+            duration_ms = s.duration_ms,
+            error       = s.error,
+            input       = s.input,
+            output      = s.output,
+        )
+        for s in trace.steps
+    ]
+    run = RunRecord(
+        run_id         = make_run_id(),
+        run_type       = run_type,
+        question       = question,
+        session_id     = intent.session_id,
+        started_at     = started_at,
+        duration_ms    = round(duration, 1),
+        status         = "success",
+        steps          = steps,
+        final_viz_type = intent.viz_type,
+        reasoning_text = trace.reasoning.thinking_text if trace.reasoning else None,
+        attempts       = trace.attempts,
+    )
+    record_run(run)
+
+
+def _record_error(
+    run_type: str,
+    question: str,
+    started_at: datetime,
+    error_msg: str,
+    trace: ExecutionTrace | None,
+) -> None:
+    """Enregistre un run en erreur dans le monitoring store."""
+    duration = (datetime.now(timezone.utc) - started_at).total_seconds() * 1000
+    steps = []
+    if trace:
+        steps = [
+            StepRecord(
+                id=s.id, label=s.label, status=s.status,
+                duration_ms=s.duration_ms, error=s.error,
+                input=s.input, output=s.output,
+            )
+            for s in trace.steps
+        ]
+    run = RunRecord(
+        run_id        = make_run_id(),
+        run_type      = run_type,
+        question      = question,
+        session_id    = None,
+        started_at    = started_at,
+        duration_ms   = round(duration, 1),
+        status        = "error",
+        steps         = steps,
+        error_message = error_msg[:500],
+    )
+    record_run(run)
+
+
 # ── Gestion centralisée des erreurs OpenRouter ─────────────────────────────
 
 def _handle_openrouter_error(e: Exception, trace: ExecutionTrace) -> HTTPException:
-    """Transforme une exception en HTTPException avec trace partielle."""
     if isinstance(e, httpx.HTTPStatusError):
         status = e.response.status_code if e.response else 503
         _fail_trace(trace, "llm_processing", str(e))
@@ -128,16 +270,22 @@ def _handle_openrouter_error(e: Exception, trace: ExecutionTrace) -> HTTPExcepti
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
 
+@app.post("/setup", summary="Génère les formules Tableau à créer dans le classeur")
+async def setup(body: dict):
+    fields = body.get("fields", [])
+    if not fields:
+        raise HTTPException(status_code=422, detail={"error": "fields requis et non vide."})
+    return build_setup_guide(fields)
+
+
 @app.get("/health")
 async def health():
-    """Vérifie la configuration de la clé API OpenRouter."""
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     if not api_key:
         raise HTTPException(status_code=500, detail={
             "error": "OPENROUTER_API_KEY non définie",
-            "detail": "Créer un fichier .env avec OPENROUTER_API_KEY=sk-or-...",
+            "detail": "Créer backend/.env avec OPENROUTER_API_KEY=sk-or-...",
         })
-    # Ping léger : liste des modèles OpenRouter (sans authentification complète)
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             res = await client.get("https://openrouter.ai/api/v1/models")
@@ -146,30 +294,18 @@ async def health():
         raise HTTPException(status_code=503, detail={
             "error": "OpenRouter inaccessible", "detail": str(e),
         })
-    return {
-        "status": "ok",
-        "provider": "openrouter",
-        "model": OPENROUTER_MODEL,
-        "api_key_set": True,
-    }
+    return {"status": "ok", "provider": "openrouter", "model": OPENROUTER_MODEL, "api_key_set": True}
 
 
 @app.post(
     "/generate-viz",
     response_model=VizIntentResponse,
-    responses={
-        422: {"model": ErrorResponse},
-        500: {"model": ErrorResponse},
-        503: {"model": ErrorResponse},
-        504: {"model": ErrorResponse},
-    },
+    responses={422: {"model": ErrorResponse}, 500: {"model": ErrorResponse},
+               503: {"model": ErrorResponse}, 504: {"model": ErrorResponse}},
 )
 async def generate_viz(request: VizIntentRequest):
-    """
-    Génère une intention de visualisation depuis une question en langage naturel.
-    Retourne le JSON d'intention + session_id pour le raffinement + execution_trace avec reasoning.
-    """
     logger.info("Question : %r (%d champs)", request.question, len(request.fields))
+    started_at = datetime.now(timezone.utc)
 
     trace = make_default_trace()
     _step(trace, "metadata_extraction").status = "success"
@@ -182,37 +318,26 @@ async def generate_viz(request: VizIntentRequest):
             fields=request.fields,
         )
     except Exception as e:
+        _record_error("generate", request.question, started_at, str(e), trace)
         raise _handle_openrouter_error(e, trace)
 
-    intent = _build_response(result, trace)
-    logger.info(
-        "Intent OK — type=%s llm=%.0fms map=%.0fms session=%s",
-        intent.viz_type, result.llm_duration_ms, result.map_duration_ms, result.session_id,
-    )
+    intent = _build_response(result, trace, request.fields)
+    _record_success(result, intent, "generate", request.question, started_at)
+    logger.info("Intent OK — type=%s llm=%.0fms map=%.0fms", intent.viz_type,
+                result.llm_duration_ms, result.map_duration_ms)
     return intent
 
 
 @app.post(
     "/refine-viz",
     response_model=VizIntentResponse,
-    responses={
-        400: {"model": ErrorResponse},
-        422: {"model": ErrorResponse},
-        500: {"model": ErrorResponse},
-    },
-    summary="Raffiner le résultat précédent avec un feedback utilisateur",
-    description=(
-        "Envoie un feedback (ex: 'Are you sure?', 'Use a line chart') au LLM. "
-        "Le contexte de raisonnement est préservé via session_id. "
-        "Retourne un nouveau VizIntentResponse avec le même session_id."
-    ),
+    responses={400: {"model": ErrorResponse}, 422: {"model": ErrorResponse},
+               500: {"model": ErrorResponse}},
+    summary="Raffiner le résultat avec un feedback utilisateur",
 )
 async def refine_viz(request: VizRefinementRequest):
-    """
-    Raffinement du graphique via dialogue.
-    Le LLM continue son raisonnement depuis le point où il s'était arrêté.
-    """
     logger.info("Raffinement session=%s feedback=%r", request.session_id, request.feedback)
+    started_at = datetime.now(timezone.utc)
 
     trace = make_default_trace()
     _step(trace, "metadata_extraction").status = "success"
@@ -226,13 +351,80 @@ async def refine_viz(request: VizRefinementRequest):
             fields=request.fields,
         )
     except ValueError as e:
-        # Session introuvable ou expirée
-        raise HTTPException(status_code=400, detail={
-            "error": "Session invalide", "detail": str(e),
-        })
+        _record_error("refine", request.feedback, started_at, str(e), trace)
+        raise HTTPException(status_code=400, detail={"error": "Session invalide", "detail": str(e)})
     except Exception as e:
+        _record_error("refine", request.feedback, started_at, str(e), trace)
         raise _handle_openrouter_error(e, trace)
 
-    intent = _build_response(result, trace)
+    intent = _build_response(result, trace, request.fields)
+    _record_success(result, intent, "refine", request.feedback, started_at)
     logger.info("Raffinement OK — type=%s session=%s", intent.viz_type, intent.session_id)
     return intent
+
+
+# ── Monitoring ─────────────────────────────────────────────────────────────
+
+@app.get("/monitoring", response_class=HTMLResponse, include_in_schema=False)
+async def monitoring():
+    """Dashboard de monitoring Airflow-style — http://localhost:8000/monitoring"""
+    try:
+        html = _MONITORING_HTML.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        html = "<h1>monitoring.html introuvable dans backend/</h1>"
+    return HTMLResponse(content=html)
+
+
+@app.get("/api/runs", include_in_schema=False)
+async def api_runs():
+    """Liste des runs récents (summary)."""
+    runs = get_all_runs()
+    return [
+        {
+            "run_id":         r.run_id,
+            "run_type":       r.run_type,
+            "question":       r.question,
+            "session_id":     r.session_id,
+            "started_at":     r.started_at.isoformat() + "Z",
+            "duration_ms":    r.duration_ms,
+            "status":         r.status,
+            "final_viz_type": r.final_viz_type,
+            "attempts":       r.attempts,
+            "error_message":  r.error_message,
+        }
+        for r in runs
+    ]
+
+
+@app.get("/api/runs/{run_id}", include_in_schema=False)
+async def api_run_detail(run_id: str):
+    """Détail complet d'un run avec IO par étape."""
+    run = get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' introuvable.")
+    return {
+        "run_id":         run.run_id,
+        "run_type":       run.run_type,
+        "question":       run.question,
+        "session_id":     run.session_id,
+        "started_at":     run.started_at.isoformat() + "Z",
+        "duration_ms":    run.duration_ms,
+        "status":         run.status,
+        "final_viz_type": run.final_viz_type,
+        "reasoning_text": run.reasoning_text,
+        "error_message":  run.error_message,
+        "attempts":       run.attempts,
+        "model":          OPENROUTER_MODEL,
+        "steps": [
+            {
+                "id":          s.id,
+                "label":       s.label,
+                "status":      s.status,
+                "duration_ms": s.duration_ms,
+                "error":       s.error,
+                "input":       s.input,
+                "output":      s.output,
+            }
+            for s in run.steps
+        ],
+    }

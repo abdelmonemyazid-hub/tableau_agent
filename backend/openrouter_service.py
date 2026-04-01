@@ -100,6 +100,7 @@ class OpenRouterResult:
     attempts:        int
     reasoning:       ReasoningTrace
     session_id:      str
+    prompt_preview:  str = ""   # résumé du prompt envoyé (pour IO inspector)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -233,7 +234,14 @@ async def generate_viz_with_reasoning(
         {"role": "user",   "content": user_content},
     ]
 
-    return await _execute_with_retry(messages, fields, is_new_session=True)
+    result = await _execute_with_retry(messages, fields, is_new_session=True)
+    field_names = [f["name"] for f in fields]
+    result.prompt_preview = (
+        f"Question : {question}\n"
+        f"Champs ({len(fields)}) : {', '.join(field_names[:10])}"
+        + (" …" if len(field_names) > 10 else "")
+    )
+    return result
 
 
 async def refine_viz_with_reasoning(
@@ -260,8 +268,8 @@ async def refine_viz_with_reasoning(
 
     # Mettre à jour la session avec le nouvel historique
     _update_session(session_id, result._raw_messages)  # type: ignore[attr-defined]
-    result.session_id = session_id  # conserver le même session_id
-
+    result.session_id     = session_id   # conserver le même session_id
+    result.prompt_preview = f"Feedback : {feedback}"
     return result
 
 
